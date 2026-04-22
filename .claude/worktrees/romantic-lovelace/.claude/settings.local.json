@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ':*)",
+      "Bash(python3 scripts/generate_insert.py data/sample/test_upload_r2.json -o data/sample/test_upload_r2_insert.sql)"
+    ]
+  }
+}

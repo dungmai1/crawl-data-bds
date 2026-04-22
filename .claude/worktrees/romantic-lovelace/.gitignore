@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtualenv
+.venv/
+venv/
+env/
+ENV/
+
+# Playwright
+.playwright/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+/logs/
+
+# Scraped data (generated, not committed) — keep sample
+/data/raw/
+/data/clean/
+/data/final/
+/data/phones/
+!/data/sample/
+
+# Coverage & test
+.coverage
+.pytest_cache/
+htmlcov/
+.tox/
+
+# Temp
+.tmp/
+.temp/
