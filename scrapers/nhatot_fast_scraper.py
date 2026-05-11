@@ -26,6 +26,7 @@ import re
 import os
 import time
 import logging
+import unicodedata
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from typing import Optional
@@ -71,6 +72,35 @@ def save_phone_cache(cache: dict):
         json.dump(cache, f, ensure_ascii=False, indent=2)
     tmp.replace(PHONE_CACHE_FILE)
 
+
+# Failed URLs log: ghi append-only mọi listing reveal phone thất bại
+# Format: 1 JSON object/dòng (JSONL) — an toàn cả khi process crash giữa cycle
+FAILED_URLS_FILE = Path("data/failed_phone_urls.jsonl")
+
+
+def log_failed_url(list_id, url: str, reason: str, **extra):
+    """Append failed URL record to JSONL log for later investigation."""
+    FAILED_URLS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "timestamp": datetime.now().isoformat(),
+        "list_id": list_id,
+        "url": url,
+        "reason": reason,
+        **extra,
+    }
+    try:
+        with open(FAILED_URLS_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log.debug(f"Cannot write failed_urls log: {e}")
+
+
+def _vn_slug(text: str) -> str:
+    """Convert Vietnamese text to URL-safe slug (no diacritics, lowercase, dash-separated)."""
+    nfkd = unicodedata.normalize("NFKD", text)
+    no_accent = "".join(c for c in nfkd if not unicodedata.combining(c))
+    return no_accent.replace("đ", "d").replace("Đ", "d").lower().replace(" ", "-")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -91,7 +121,7 @@ HEADERS = {
 
 async def scrape_api_batch(
     region: int = 13000,
-    max_listings: int = 500,
+    max_listings: int = 200,
     categories: list = None,
     offset_shift: int = 0,
 ) -> list[dict]:
@@ -206,11 +236,14 @@ async def reveal_phones_batch(
     ads: list[dict],
     num_tabs: int = 5,
     existing_phones: set = None,
+    batch_size: int = 50,
+    cooldown_seconds: int = 15,
 ) -> dict[int, str]:
-    """Reveal SĐT cho nhiều listings cùng lúc bằng nhiều tabs."""
+    """Reveal SĐT cho nhiều listings cùng lúc bằng nhiều tabs.
 
-    from playwright.async_api import async_playwright
-
+    Restart browser context sau mỗi `batch_size` reveals + cooldown `cooldown_seconds`s
+    để tránh shadow-ban từ chotot anti-bot (sau ~150 reveals server strip button).
+    """
     if existing_phones is None:
         existing_phones = set()
 
@@ -226,13 +259,64 @@ async def reveal_phones_batch(
 
     log.info(f"Phone: {len(to_reveal)} listings to reveal with {num_tabs} tabs")
 
-    # Build URL map from search pages first
-    url_map = await _build_url_map(to_reveal)
+    # url_map rỗng — mọi listing dùng fallback URL (server tìm listing bằng list_id, slug chỉ là SEO)
+    url_map = {}
 
-    phone_results = {}  # list_id -> phone
+    phone_results = {}  # list_id -> phone, accumulated across all batches
+    total = len(to_reveal)
+    n_batches = (total + batch_size - 1) // batch_size
+    log.info(
+        f"Phone: split {total} reveals into {n_batches} batch(es) of {batch_size}, "
+        f"cooldown={cooldown_seconds}s between batches"
+    )
+
+    for batch_idx in range(n_batches):
+        batch_start = batch_idx * batch_size
+        current_batch = to_reveal[batch_start:batch_start + batch_size]
+        log.info(
+            f"=== Browser batch {batch_idx + 1}/{n_batches}: "
+            f"ads {batch_start + 1}-{batch_start + len(current_batch)} of {total} ==="
+        )
+
+        await _process_phone_batch(
+            current_batch=current_batch,
+            batch_offset=batch_start,
+            total=total,
+            num_tabs=num_tabs,
+            url_map=url_map,
+            phone_results=phone_results,
+        )
+
+        # Cooldown trước batch tiếp theo (skip nếu là batch cuối)
+        if batch_idx + 1 < n_batches:
+            log.info(
+                f"  Phones cumulative: {len(phone_results)} | "
+                f"Cooldown {cooldown_seconds}s before next browser session..."
+            )
+            await asyncio.sleep(cooldown_seconds)
+
+    log.info(f"Phone: revealed {len(phone_results)}/{len(to_reveal)} phones")
+    return phone_results
+
+
+async def _process_phone_batch(
+    current_batch: list[dict],
+    batch_offset: int,
+    total: int,
+    num_tabs: int,
+    url_map: dict,
+    phone_results: dict,
+):
+    """Process 1 batch of listings với fresh browser context.
+
+    Mục đích: restart browser giữa các batch để tránh shadow-ban từ chotot anti-bot.
+    `phone_results` được mutate in-place để accumulate cross-batch.
+    """
+    from playwright.async_api import async_playwright
+
     queue = asyncio.Queue()
-    for i, ad in enumerate(to_reveal):
-        queue.put_nowait((i + 1, ad))
+    for i, ad in enumerate(current_batch):
+        queue.put_nowait((batch_offset + i + 1, ad))
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -261,38 +345,62 @@ async def reveal_phones_batch(
 
                 list_id = ad["list_id"]
                 title = ad.get("subject", "")[:35]
-                total = len(to_reveal)
+                # `total` đã được pass vào từ caller
 
                 # Get URL
                 detail_url = url_map.get(list_id)
                 if not detail_url:
-                    district = ad.get("area_name", "").lower().replace(" ", "-")
-                    detail_url = f"https://www.nhatot.com/mua-ban-{district}-tp-ho-chi-minh/{list_id}.htm"
+                    # Slug không dấu + đúng path "mua-ban-nha-dat" để khỏi bị server redirect
+                    district = _vn_slug(ad.get("area_name", ""))
+                    detail_url = f"https://www.nhatot.com/mua-ban-nha-dat-{district}-tp-ho-chi-minh/{list_id}.htm"
 
                 phone_found = None
+                phone_api_status = None
+                phone_api_body = None
 
                 # Intercept
                 async def on_resp(response):
-                    nonlocal phone_found
+                    nonlocal phone_found, phone_api_status, phone_api_body
                     try:
-                        if (
-                            "gateway.chotot.com" in response.url
-                            and "/phone" in response.url
-                            and response.status == 200
-                        ):
-                            body = await response.json()
-                            bs = json.dumps(body)
-                            full = re.findall(r'"phone"\s*:\s*"(0\d{8,9})"', bs)
-                            if full:
-                                phone_found = full[0]
-                    except:
-                        pass
+                        if "gateway.chotot.com" in response.url and "/phone" in response.url:
+                            phone_api_status = response.status
+                            if response.status == 200:
+                                body = await response.json()
+                                bs = json.dumps(body)
+                                full = re.findall(r'"phone"\s*:\s*"(0\d{8,9})"', bs)
+                                if full:
+                                    phone_found = full[0]
+                                else:
+                                    phone_api_body = bs[:300]
+                                    log.warning(f"[T{tab_id}] phone API 200 nhưng body không có phone: {bs[:200]}")
+                            else:
+                                try:
+                                    err_body = await response.text()
+                                    phone_api_body = err_body[:300]
+                                    log.warning(f"[T{tab_id}] phone API status={response.status}: {err_body[:200]}")
+                                except Exception:
+                                    log.warning(f"[T{tab_id}] phone API status={response.status} (không đọc được body)")
+                    except Exception as e:
+                        log.debug(f"on_resp parse error: {e}")
 
                 page.on("response", on_resp)
 
                 try:
                     await page.goto(detail_url, wait_until="domcontentloaded", timeout=20000)
-                    await page.wait_for_timeout(2500)
+
+                    # Đợi button "Hiện số" thật sự render (max 8s) — thay cho sleep cố định
+                    try:
+                        await page.wait_for_function(
+                            """() => {
+                                return Array.from(document.querySelectorAll('button, a')).some(
+                                    el => /hiện số/i.test(el.textContent) && el.offsetWidth > 0
+                                );
+                            }""",
+                            timeout=8000,
+                        )
+                    except Exception:
+                        # Button không xuất hiện trong 8s — có thể expired/captcha/anti-bot
+                        pass
 
                     # Check expired
                     expired = await page.evaluate(
@@ -340,12 +448,63 @@ async def reveal_phones_batch(
                             f"[T{tab_id}] ({idx}/{total}) OK: {phone_found} | {title}"
                         )
                     else:
-                        log.info(f"[T{tab_id}] ({idx}/{total}) NO_PHONE | {title}")
+                        # Capture chẩn đoán: tại sao không có phone?
+                        btn_found = btn is not None
+                        try:
+                            final_url = page.url
+                        except Exception:
+                            final_url = None
+                        try:
+                            page_title = await page.title()
+                        except Exception:
+                            page_title = None
+                        try:
+                            has_captcha = await page.evaluate("""
+                                () => !!document.querySelector(
+                                    'iframe[src*="recaptcha"], iframe[src*="challenge"], iframe[title*="captcha" i]'
+                                )
+                            """)
+                        except Exception:
+                            has_captcha = None
+                        try:
+                            needs_login = await page.evaluate("""
+                                () => /vui lòng đăng nhập|please log in/i.test(document.body.innerText.slice(0, 5000))
+                            """)
+                        except Exception:
+                            needs_login = None
+
+                        log.info(
+                            f"[T{tab_id}] ({idx}/{total}) NO_PHONE | "
+                            f"btn={btn_found} captcha={has_captcha} login={needs_login} "
+                            f"api_status={phone_api_status} | {title}"
+                        )
+                        log_failed_url(
+                            list_id,
+                            detail_url,
+                            reason="no_phone_revealed",
+                            api_status=phone_api_status,
+                            api_body=phone_api_body,
+                            btn_found=btn_found,
+                            final_url=final_url,
+                            page_title=(page_title[:100] if page_title else None),
+                            has_captcha=has_captcha,
+                            needs_login=needs_login,
+                            used_fallback_url=(url_map.get(list_id) is None),
+                            title=title,
+                        )
 
                     processed += 1
 
                 except Exception as e:
                     log.warning(f"[T{tab_id}] ({idx}/{total}) ERROR: {str(e)[:60]}")
+                    log_failed_url(
+                        list_id,
+                        detail_url,
+                        reason="exception",
+                        error=str(e)[:200],
+                        api_status=phone_api_status,
+                        title=title,
+                    )
 
                 finally:
                     page.remove_listener("response", on_resp)
@@ -360,68 +519,15 @@ async def reveal_phones_batch(
         await asyncio.gather(*[tab_worker(i + 1) for i in range(num_tabs)])
         await browser.close()
 
-    log.info(f"Phone: revealed {len(phone_results)}/{len(to_reveal)} phones")
-    return phone_results
-
-
-async def _build_url_map(ads: list[dict]) -> dict[int, str]:
-    """Lấy correct listing URLs từ search page."""
-    from playwright.async_api import async_playwright
-
-    url_map = {}
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        ctx = await browser.new_context(
-            user_agent=HEADERS["User-Agent"],
-            viewport={"width": 1280, "height": 800},
-            locale="vi-VN",
-        )
-        await ctx.add_init_script(
-            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
-        )
-        page = await ctx.new_page()
-
-        pages_needed = max(1, len(ads) // 20)
-        for pg in range(1, min(pages_needed + 1, 10)):
-            search_url = "https://www.nhatot.com/mua-ban-nha-dat-tp-ho-chi-minh"
-            if pg > 1:
-                search_url += f"?page={pg}"
-
-            try:
-                await page.goto(search_url, wait_until="networkidle", timeout=30000)
-                await page.wait_for_timeout(2000)
-
-                links = await page.evaluate("""
-                    () => [...document.querySelectorAll('a[href]')]
-                        .filter(a => /\\/\\d+\\.htm/.test(a.href) && a.href.includes('nhatot.com'))
-                        .map(a => a.href)
-                """)
-
-                for link in links:
-                    m = re.search(r"/(\d+)\.htm", link)
-                    if m:
-                        url_map[int(m.group(1))] = link.split("#")[0]
-
-            except Exception as e:
-                log.warning(f"Search page {pg} error: {e}")
-
-        await browser.close()
-
-    log.info(f"URL map: {len(url_map)} URLs from search pages")
-    return url_map
-
 
 # ===========================================================
 # MAIN: KẾT HỢP CẢ 2 TẦNG
 # ===========================================================
 
 async def run_cycle(
-    max_listings: int = 500,
+    max_listings: int = 200,
     num_tabs: int = 5,
+    batch_size: int = 50,
     api_only: bool = False,
     region: int = 13000,
     offset_shift: int = 0,
@@ -431,36 +537,20 @@ async def run_cycle(
     start = time.time()
     log.info(f"\n{'='*60}")
     log.info(f"  CYCLE START — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    log.info(f"  Listings: {max_listings} | Tabs: {num_tabs} | API-only: {api_only} | Offset shift: {offset_shift}")
+    log.info(
+        f"  Listings: {max_listings} | Tabs: {num_tabs} | Batch size: {batch_size} | "
+        f"API-only: {api_only} | Offset shift: {offset_shift}"
+    )
     log.info(f"{'='*60}")
-
-    # Load persistent phone cache — skip các list_id đã thử (cả success lẫn fail)
-    phone_cache = load_phone_cache()
-    attempted_ids = {int(k) for k in phone_cache.keys() if str(k).isdigit()}
-    phone_known = {int(k): v for k, v in phone_cache.items() if str(k).isdigit() and v}
-    log.info(f"Phone cache: {len(phone_known)} có phone, {len(attempted_ids) - len(phone_known)} đã thử (fail)")
 
     # Tầng 1: API
     ads = await scrape_api_batch(region=region, max_listings=max_listings, offset_shift=offset_shift)
     ads = await enrich_with_detail(ads, max_concurrent=10)
 
-    # Filter new (chưa attempted)
-    new_ads = [a for a in ads if a.get("list_id") not in attempted_ids]
-    log.info(f"New listings (cần reveal): {len(new_ads)}/{len(ads)}")
-
     # Tầng 2: Phone (nếu không phải api-only)
-    phone_map = dict(phone_known)  # Kế thừa phones đã biết
-    if not api_only and new_ads:
-        new_phone_map = await reveal_phones_batch(new_ads, num_tabs, attempted_ids)
-        phone_map.update(new_phone_map)
-
-        # Cập nhật cache: mọi new_ad đã thử → ghi vào cache (success = phone, fail = null)
-        for ad in new_ads:
-            lid = ad.get("list_id")
-            if lid:
-                phone_cache[str(lid)] = new_phone_map.get(lid)
-        save_phone_cache(phone_cache)
-        log.info(f"Phone cache updated: {len(phone_cache)} total entries")
+    phone_map = {}
+    if not api_only and ads:
+        phone_map = await reveal_phones_batch(ads, num_tabs, batch_size=batch_size)
 
     # === MERGE PHONE INTO RAW ADS BEFORE PIPELINE ===
     # Inject phone directly into raw ad dict so pipeline gets full data + phone together
@@ -509,7 +599,6 @@ async def run_cycle(
     output = {
         "source": "nhatot",
         "total": len(results),
-        "new": len(new_ads),
         "full_phone": phones_found,
         "avg_quality": round(avg_quality, 1),
         "cycle_time_sec": int(time.time() - start),
@@ -523,7 +612,7 @@ async def run_cycle(
     elapsed = int(time.time() - start)
     log.info(f"\n{'='*60}")
     log.info(f"  CYCLE DONE in {elapsed}s")
-    log.info(f"  Total: {len(results)} | New: {len(new_ads)} | Phones: {phones_found}")
+    log.info(f"  Total: {len(results)} | Phones: {phones_found}")
     log.info(f"  Avg quality: {avg_quality:.0f}/100")
     log.info(f"  Saved: {output_file}")
     log.info(f"{'='*60}")
@@ -555,6 +644,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="V-Nexus Nhatot Fast Scraper")
     parser.add_argument("--count", type=int, default=500, help="Max listings per cycle")
     parser.add_argument("--tabs", type=int, default=5, help="Parallel browser tabs")
+    parser.add_argument("--batch-size", type=int, default=50, help="Phone reveal batch size before cooldown")
     parser.add_argument("--api-only", action="store_true", help="Only API, no phone reveal")
     parser.add_argument("--region", type=int, default=13000, help="13000=HCM, 12000=HN")
     parser.add_argument("--loop", action="store_true", help="Run continuously every hour")
@@ -568,12 +658,14 @@ if __name__ == "__main__":
             interval_minutes=args.interval,
             max_listings=args.count,
             num_tabs=args.tabs,
+            batch_size=args.batch_size,
             region=args.region,
         ))
     else:
         asyncio.run(run_cycle(
             max_listings=args.count,
             num_tabs=args.tabs,
+            batch_size=args.batch_size,
             api_only=args.api_only,
             region=args.region,
             offset_shift=args.offset_shift,

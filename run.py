@@ -42,10 +42,20 @@ logging.basicConfig(
 log = logging.getLogger("runner")
 
 
-async def scrape_nhatot(count: int = 500, tabs: int = 5, region: int = 13000) -> str:
+async def scrape_nhatot(
+    count: int = 200,
+    tabs: int = 5,
+    batch_size: int = 50,
+    region: int = 13000,
+) -> str:
     """Run nhatot scraper. Returns output file path."""
     from nhatot_fast_scraper import run_cycle
-    result = await run_cycle(max_listings=count, num_tabs=tabs, region=region)
+    result = await run_cycle(
+        max_listings=count,
+        num_tabs=tabs,
+        batch_size=batch_size,
+        region=region,
+    )
     return result.get("file") if isinstance(result, dict) else None
 
 
@@ -99,8 +109,9 @@ async def full_cycle(
     skip_scrape: bool = False,
     nhatot_only: bool = False,
     muaban_only: bool = False,
-    nhatot_count: int = 500,
+    nhatot_count: int = 200,
     nhatot_tabs: int = 5,
+    nhatot_batch_size: int = 50,
     muaban_per_city: int = 500,
     muaban_category: str = "all",
 ):
@@ -128,7 +139,11 @@ async def full_cycle(
         if not muaban_only:
             log.info("\n  [nhatot] Starting...")
             try:
-                nhatot_raw = await scrape_nhatot(count=nhatot_count, tabs=nhatot_tabs)
+                nhatot_raw = await scrape_nhatot(
+                    count=nhatot_count,
+                    tabs=nhatot_tabs,
+                    batch_size=nhatot_batch_size,
+                )
                 log.info(f"  [nhatot] Done → {nhatot_raw}")
             except Exception as e:
                 log.error(f"  [nhatot] Failed: {e}")
@@ -200,24 +215,24 @@ async def full_cycle(
         log.error("No clean data to merge")
         return None
 
-    # === STEP 4: UPLOAD IMAGES → CLOUDFLARE R2 ===
-    log.info(f"\n{'='*50}")
-    log.info(f"  STEP 4: UPLOAD IMAGES → CLOUDFLARE R2")
-    log.info(f"{'='*50}")
+    # # === STEP 4: UPLOAD IMAGES → CLOUDFLARE R2 ===
+    # log.info(f"\n{'='*50}")
+    # log.info(f"  STEP 4: UPLOAD IMAGES → CLOUDFLARE R2")
+    # log.info(f"{'='*50}")
 
-    final_file_for_upload = find_latest_final()
-    if final_file_for_upload:
-        try:
-            from image_uploader import upload_all_in_final_file
-            stats = await upload_all_in_final_file(final_file_for_upload)
-            log.info(
-                f"  Images: {stats['uploaded']} uploaded, "
-                f"{stats['skipped']} skipped (already in R2), "
-                f"{stats['failed']} failed "
-                f"(total {stats['total_images']})"
-            )
-        except Exception as e:
-            log.error(f"  Image upload failed: {e} — final file retains original URLs")
+    # final_file_for_upload = find_latest_final()
+    # if final_file_for_upload:
+    #     try:
+    #         from image_uploader import upload_all_in_final_file
+    #         stats = await upload_all_in_final_file(final_file_for_upload)
+    #         log.info(
+    #             f"  Images: {stats['uploaded']} uploaded, "
+    #             f"{stats['skipped']} skipped (already in R2), "
+    #             f"{stats['failed']} failed "
+    #             f"(total {stats['total_images']})"
+    #         )
+    #     except Exception as e:
+    #         log.error(f"  Image upload failed: {e} — final file retains original URLs")
 
     # === SUMMARY ===
     elapsed = int(time.time() - start)
@@ -245,6 +260,7 @@ async def accumulate_phones_nhatot(
     target: int,
     per_cycle: int = 500,
     tabs: int = 5,
+    batch_size: int = 50,
     region: int = 13000,
     max_cycles: int = 20,
 ) -> str:
@@ -279,6 +295,7 @@ async def accumulate_phones_nhatot(
             await nhatot_run_cycle(
                 max_listings=per_cycle,
                 num_tabs=tabs,
+                batch_size=batch_size,
                 region=region,
                 offset_shift=offset_shift,
             )
@@ -498,6 +515,7 @@ if __name__ == "__main__":
     parser.add_argument("--muaban-only", action="store_true", help="Only scrape muaban")
     parser.add_argument("--nhatot-count", type=int, default=500, help="Nhatot listings count")
     parser.add_argument("--nhatot-tabs", type=int, default=5, help="Nhatot browser tabs")
+    parser.add_argument("--nhatot-batch-size", type=int, default=50, help="Nhatot phone reveal batch size")
     parser.add_argument("--muaban-per-city", type=int, default=500, help="Muaban listings per city")
     parser.add_argument("--muaban-category", default="all", help="Muaban subcategory (e.g. dat-tho-cu). Default: all")
     parser.add_argument("--loop", action="store_true", help="Run continuously")
@@ -515,6 +533,7 @@ if __name__ == "__main__":
             target=args.target_phones,
             per_cycle=args.per_cycle,
             tabs=args.nhatot_tabs,
+            batch_size=args.nhatot_batch_size,
             max_cycles=args.max_cycles,
         ))
     elif args.loop:
@@ -522,6 +541,7 @@ if __name__ == "__main__":
             interval_min=args.interval,
             nhatot_count=args.nhatot_count,
             nhatot_tabs=args.nhatot_tabs,
+            nhatot_batch_size=args.nhatot_batch_size,
             muaban_per_city=args.muaban_per_city,
             muaban_category=args.muaban_category,
         ))
@@ -532,6 +552,7 @@ if __name__ == "__main__":
             muaban_only=args.muaban_only,
             nhatot_count=args.nhatot_count,
             nhatot_tabs=args.nhatot_tabs,
+            nhatot_batch_size=args.nhatot_batch_size,
             muaban_per_city=args.muaban_per_city,
             muaban_category=args.muaban_category,
         ))
