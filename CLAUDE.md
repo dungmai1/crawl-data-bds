@@ -11,21 +11,20 @@ Python 3.11 scrapers thu thập property listings từ các portal BĐS Việt N
 
 ```
 .
-├── run.py                   # Master runner: scrape → pipeline → merge
+├── run.py                   # Master runner: scrape → pipeline (per-source final, no merge)
 ├── config.py                # Path convention + session timestamp
 ├── requirements.txt
 ├── .env.example
 ├── scrapers/                # Per-source scrapers
 │   ├── nhatot_fast_scraper.py   # httpx fast layer + Playwright phone reveal
 │   └── muaban_scraper.py        # Playwright (Cloudflare bypass) + API intercept
-├── pipeline/                # Normalization & merging
-│   ├── unified_pipeline.py      # Raw → PropertyDTO (35 fields)
-│   ├── merge_pipeline.py        # Cross-source dedup (ward + price ±15% + area ±10%)
+├── pipeline/                # Normalization
+│   ├── unified_pipeline.py      # Raw → PropertyDTO (31 fields)
+│   ├── merge_pipeline.py        # (manual only) cross-source dedup — not in run.py flow
 │   └── reference/               # VN admin divisions (province/ward JSON)
 ├── data/                    # Scraped output (gitignored except sample/)
 │   ├── raw/{source}/{YYYY-MM-DD}/{HHMMSS}_raw.json
-│   ├── clean/{source}/{YYYY-MM-DD}/{HHMMSS}_clean.json
-│   ├── final/{YYYY-MM-DD}/{HHMMSS}_merged.json
+│   ├── final/{source}/{YYYY-MM-DD}/{HHMMSS}.json
 │   └── sample/              # Committed sample output (reference for backend)
 └── logs/{YYYY-MM-DD}/{HHMMSS}_{source}.log
 ```
@@ -39,8 +38,7 @@ pip install -r requirements.txt
 playwright install chromium
 
 # Run
-python run.py                          # Full cycle: scrape + pipeline + merge
-python run.py --skip-scrape            # Re-run pipeline on latest raw
+python run.py                          # Full cycle: scrape + pipeline (per-source final)
 python run.py --nhatot-only            # Only nhatot
 python run.py --muaban-only            # Only muaban
 python run.py --loop --interval 60     # Loop every 60 min
@@ -55,9 +53,9 @@ pytest
 - Fast layer: `httpx` with 10 concurrent requests
 - Slow layer: Playwright phone reveal, only for new listings
 
-**Pipeline flow:** Raw JSON → Source Adapter → Address Mapping → Price Validation → Property Classification → Broker Detection → Quality Score → `PropertyDTO`
+**Pipeline flow (per source):** Raw JSON → Source Adapter → Address Mapping → Price Validation → Property Classification → Broker Detection → `PropertyDTO` → `data/final/{source}/...`
 
-**Merge:** Match listings across sources by `ward + price (±15%) + area (±10%)`, take strongest field from each source, dedupe.
+**No cross-source merge:** nhatot and muaban stay in separate files. `merge_pipeline.py` is kept for manual ad-hoc merging (`python pipeline/merge_pipeline.py --nhatot ... --muaban ...` → `data/final/merged/...`) but is not part of `run.py`.
 
 ## Conventions
 
@@ -69,7 +67,7 @@ pytest
 
 ## Data schema
 
-Output conforms to `PropertyDTO` (35 fields). Sample output: `data/sample/2026-04-14_merged.json`.
+Output conforms to `PropertyDTO` (31 fields). Sample output: `data/sample/2026-04-14_merged.json`.
 Shared PostgreSQL schema owned by Spring Boot backend — scraper reads Flyway migrations cho truth.
 
 ## Không thuộc phạm vi repo này

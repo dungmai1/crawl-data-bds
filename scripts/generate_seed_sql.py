@@ -205,7 +205,7 @@ def main():
             f"{sql_num(x.get('area'))}, "
             f"{sql_str(x.get('legal_document'))}, "
             "'ACTIVE', "
-            f"{sql_num(x.get('quality_score'))}, "
+            "NULL, "  # trust_score — scraper no longer computes this score
             f"{sql_str(listing_types)}, "
             f"{sql_str(slug)}, "
             f"{sql_text_array(x.get('images') or [])}, "

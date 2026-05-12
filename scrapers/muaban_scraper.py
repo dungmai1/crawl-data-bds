@@ -7,8 +7,9 @@ Strategy (proven):
   2. Click vào /bat-dong-san → browser có session hợp lệ
   3. Browser gọi /listing/v1/classifieds/latest... → API trả items/page + FULL PHONE
   4. Pagination: offset 0 → max items
-  5. Detail Enrichment: Truy cập source_url từng item, bóc __NEXT_DATA__ JSON 
-     để lấy mảng ảnh gốc, tọa độ GPS, tên đường, pháp lý, số tầng, TÊN NGƯỜI ĐĂNG...
+  5. Detail Enrichment: Truy cập source_url từng item, bóc __NEXT_DATA__ JSON
+     để lấy mảng ảnh gốc, tên đường, pháp lý, số tầng, TÊN NGƯỜI ĐĂNG...
+     (muaban API/__NEXT_DATA__ không trả lat/lng nên không cào tọa độ)
 
 Usage:
     python muaban_scraper.py                     # Default: HCM, 500 items
@@ -165,8 +166,6 @@ async def enrich_detail_data(page, source_url: str) -> dict:
     """
     enriched_data = {
         "images": [],
-        "lat": None,
-        "lng": None,
         "street": None,
         "direction": None,
         "floors": None,
@@ -235,23 +234,17 @@ async def enrich_detail_data(page, source_url: str) -> dict:
                 break
 
         # ---------------------------------------------------------
-        # 5. Khai thác dữ liệu vàng từ __NEXT_DATA__ JSON 
-        # (Chính xác nhất cho contact_name, GPS, street)
+        # 5. Khai thác dữ liệu vàng từ __NEXT_DATA__ JSON
+        # (Chính xác nhất cho contact_name, street)
         # ---------------------------------------------------------
         script_tag = soup.find("script", id="__NEXT_DATA__")
         if script_tag:
             try:
                 data = json.loads(script_tag.string)
-                classified = data.get("props", {}).get("pageProps", {}).get("classified", {})
-                
+                classified = data.get("props", {}).get("pageProps", {}).get("classified", {}) or {}
+
                 if classified:
-                    # Tọa độ GPS & Tên Đường
-                    lat_lng_str = classified.get("lat_lng", "")
-                    if lat_lng_str and "," in lat_lng_str:
-                        lat_str, lng_str = lat_lng_str.split(",")
-                        enriched_data["lat"] = float(lat_str.strip())
-                        enriched_data["lng"] = float(lng_str.strip())
-                    
+                    # Tên đường
                     address = classified.get("address", "")
                     if address:
                         enriched_data["street"] = address.split(",")[0].strip()
@@ -261,12 +254,12 @@ async def enrich_detail_data(page, source_url: str) -> dict:
                     api_contact = classified.get("contact_name")
                     if not api_contact and classified.get("user"):
                         api_contact = classified["user"].get("fullname") or classified["user"].get("username")
-                    
+
                     if api_contact:
                         enriched_data["contact_name"] = api_contact.strip()
 
             except Exception as e:
-                pass
+                log.warning(f"  [__NEXT_DATA__ parse failed] at {source_url}: {e}")
 
     except Exception as e:
         log.warning(f"  [Detail Enrichment Error] at {source_url}: {e}")

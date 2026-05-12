@@ -11,8 +11,7 @@ Strategy:
      - muaban: phone_full
      - merge: cross-reference for phone + GPS + legal enrichment
   4. Dedup: giữ record merged, loại bỏ duplicate
-  5. Quality rescore: tính lại quality sau merge
-  6. Output: 1 JSON file — data sạch, đầy đủ nhất, sẵn sàng INSERT DB
+  5. Output: 1 JSON file — data sạch, đầy đủ nhất, sẵn sàng INSERT DB
 
 Usage:
     python merge_pipeline.py
@@ -156,35 +155,6 @@ def merge_two_items(primary: dict, secondary: dict) -> dict:
     return merged
 
 
-def calc_quality_score(item: dict) -> int:
-    """Recalculate quality score after merge."""
-    s = 0
-    checks = [
-        (item.get("title"), 8),
-        (item.get("price"), 12),
-        (item.get("area"), 12),
-        (item.get("province"), 8),
-        (item.get("ward"), 5),
-        (item.get("street"), 5),
-        (item.get("full_address"), 3),
-        (item.get("lat") and item.get("lng"), 8),
-        (item.get("images") and len(item.get("images", [])) > 0, 4),
-        (item.get("description") and len(item.get("description", "")) > 50, 4),
-        (item.get("bedrooms"), 3),
-        (item.get("bathrooms"), 3),
-        (item.get("floors"), 2),
-        (item.get("direction"), 3),
-        (item.get("legal_document"), 3),
-        (item.get("phone_full"), 10),
-        (item.get("contact_name"), 2),
-        (item.get("property_type") and item["property_type"] != "loai-bds-khac", 3),
-        (item.get("poster_type") and item["poster_type"] != "khong_xac_dinh", 2),
-    ]
-    for val, pts in checks:
-        if val: s += pts
-    return min(s, 100)
-
-
 def run_merge(nhatot_file: str, muaban_file: str):
     """Run the full merge pipeline."""
 
@@ -236,15 +206,7 @@ def run_merge(nhatot_file: str, muaban_file: str):
     all_items = merged_items + unmatched_nt + unmatched_mb
     log.info(f"  Total before dedup: {len(all_items)}")
 
-    # === STEP 3: Recalculate quality scores ===
-    log.info("\n--- STEP 3: Quality rescore ---")
-    for item in all_items:
-        item["quality_score"] = calc_quality_score(item)
-
-    # Sort by quality descending
-    all_items.sort(key=lambda x: x["quality_score"], reverse=True)
-
-    # === STEP 4: Final stats ===
+    # === STEP 3: Final stats ===
     total = len(all_items)
     has_phone = sum(1 for i in all_items if i.get("phone_full"))
     has_gps = sum(1 for i in all_items if i.get("lat") and i.get("lng"))
@@ -252,13 +214,6 @@ def run_merge(nhatot_file: str, muaban_file: str):
     has_legal = sum(1 for i in all_items if i.get("legal_document"))
     has_direction = sum(1 for i in all_items if i.get("direction"))
     merged_count = sum(1 for i in all_items if i.get("_merged_from"))
-    avg_quality = sum(i["quality_score"] for i in all_items) / max(total, 1)
-
-    # Quality distribution
-    excellent = sum(1 for i in all_items if i["quality_score"] >= 80)
-    good = sum(1 for i in all_items if 60 <= i["quality_score"] < 80)
-    fair = sum(1 for i in all_items if 40 <= i["quality_score"] < 60)
-    poor = sum(1 for i in all_items if i["quality_score"] < 40)
 
     # Source distribution
     from collections import Counter
@@ -277,13 +232,6 @@ def run_merge(nhatot_file: str, muaban_file: str):
     log.info(f"    Legal doc:      {has_legal:>6} ({has_legal/total*100:>5.1f}%)")
     log.info(f"    Direction:      {has_direction:>6} ({has_direction/total*100:>5.1f}%)")
     log.info(f"")
-    log.info(f"  QUALITY:")
-    log.info(f"    Average:    {avg_quality:.0f}/100")
-    log.info(f"    Excellent:  {excellent}")
-    log.info(f"    Good:       {good}")
-    log.info(f"    Fair:       {fair}")
-    log.info(f"    Poor:       {poor}")
-    log.info(f"")
     log.info(f"  BY SOURCE:")
     for src, count in source_dist.most_common():
         print(f"    {src}: {count}")
@@ -293,7 +241,7 @@ def run_merge(nhatot_file: str, muaban_file: str):
     _cfg = str(Path(__file__).resolve().parent.parent)
     if _cfg not in _sys.path: _sys.path.insert(0, _cfg)
     from config import final_path
-    out = final_path()
+    out = final_path("merged")
 
     with open(out, "w", encoding="utf-8") as f:
         json.dump({
@@ -301,7 +249,6 @@ def run_merge(nhatot_file: str, muaban_file: str):
             "merged_cross_platform": merged_count,
             "phone_full": has_phone,
             "gps_coverage": has_gps,
-            "avg_quality": round(avg_quality, 1),
             "sources": dict(source_dist),
             "processed_at": datetime.now().isoformat(),
             "listings": all_items,

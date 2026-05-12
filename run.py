@@ -1,15 +1,15 @@
 """
 V-Nexus: Master Scraper Runner
-1 lệnh: cào nhatot + muaban → lọc → merge → 1 file data chuẩn
+1 lệnh: cào nhatot + muaban → lọc (normalize/classify) → ghi file final riêng từng nguồn
 
 Usage:
-    python run.py                          # Full cycle: cào cả 2 + lọc + merge
+    python run.py                          # Full cycle: cào cả 2 + lọc
     python run.py --nhatot-only            # Chỉ cào nhatot
     python run.py --muaban-only            # Chỉ cào muaban
     python run.py --loop --interval 60     # Chạy liên tục mỗi 60 phút
 
-Output:
-    data/final/{YYYY-MM-DD}/{HHMMSS}_merged.json
+Output (per source, no merge):
+    data/final/{source}/{YYYY-MM-DD}/{HHMMSS}.json
 """
 
 import asyncio
@@ -27,9 +27,8 @@ sys.path.insert(0, str(_base))
 sys.path.insert(0, str(_base / "scrapers"))
 sys.path.insert(0, str(_base / "pipeline"))
 
-from config import clean_path, final_path, find_latest_raw, find_latest_final, reset_session
+from config import final_path, find_latest_raw, reset_session
 from unified_pipeline import process_batch, AddressMapper
-from merge_pipeline import run_merge
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,8 +62,22 @@ async def scrape_muaban(per_city: int = 500, category: str = "all") -> str:
     return result.get("file") if isinstance(result, dict) else None
 
 
+def _write_final(out: str, source: str, listings: list) -> None:
+    """Write per-source final JSON with summary stats."""
+    total = len(listings)
+    phone_full = sum(1 for x in listings if x.get("phone_full"))
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump({
+            "source": source,
+            "total": total,
+            "phone_full": phone_full,
+            "processed_at": datetime.now().isoformat(),
+            "listings": listings,
+        }, f, ensure_ascii=False, indent=2)
+
+
 def run_pipeline_for_source(source: str, input_file: str, mapper: AddressMapper) -> str:
-    """Run unified pipeline on raw data. Returns clean file path."""
+    """Run unified pipeline on raw data. Returns final file path (data/final/{source}/...)."""
     with open(input_file, encoding="utf-8") as f:
         data = json.load(f)
 
@@ -75,9 +88,9 @@ def run_pipeline_for_source(source: str, input_file: str, mapper: AddressMapper)
         # Check if already processed (has 'source' field = DTO)
         if items and isinstance(items[0], dict) and items[0].get("source") == "nhatot":
             log.info(f"  [{source}] Already clean DTO ({len(items)} listings), skipping pipeline")
-            out = clean_path(source)
-            with open(out, "w", encoding="utf-8") as f:
-                json.dump({"source": source, "total": len(items), "listings": items}, f, ensure_ascii=False, indent=2)
+            out = final_path(source)
+            _write_final(out, source, items)
+            log.info(f"  [{source}] Final: {len(items)} listings → {out}")
             return out
         items = data.get("ads", items)
     else:
@@ -87,15 +100,9 @@ def run_pipeline_for_source(source: str, input_file: str, mapper: AddressMapper)
     results = process_batch(items, source, mapper)
 
     from dataclasses import asdict
-    out = clean_path(source)
-    with open(out, "w", encoding="utf-8") as f:
-        json.dump({
-            "source": source,
-            "total": len(results),
-            "listings": [asdict(r) for r in results],
-        }, f, ensure_ascii=False, indent=2)
-
-    log.info(f"  [{source}] Clean: {len(results)} listings → {out}")
+    out = final_path(source)
+    _write_final(out, source, [asdict(r) for r in results])
+    log.info(f"  [{source}] Final: {len(results)} listings → {out}")
     return out
 
 
@@ -108,7 +115,7 @@ async def full_cycle(
     muaban_per_city: int = 500,
     muaban_category: str = "all",
 ):
-    """Full cycle: scrape → pipeline → merge → final output."""
+    """Full cycle: scrape → pipeline → per-source final output."""
     reset_session()
     start = time.time()
 
@@ -116,7 +123,7 @@ async def full_cycle(
     log.info(f"  V-NEXUS FULL CYCLE — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log.info(f"{'#'*60}")
 
-    for d in ["data/raw/nhatot", "data/raw/muaban", "data/clean", "data/final"]:
+    for d in ["data/raw/nhatot", "data/raw/muaban", "data/final/nhatot", "data/final/muaban"]:
         os.makedirs(d, exist_ok=True)
 
     # === STEP 1: SCRAPE ===
@@ -156,7 +163,7 @@ async def full_cycle(
         log.error("No data files found. Run scrape first.")
         return None
 
-    # === STEP 2: PIPELINE (normalize + classify) ===
+    # === STEP 2: PIPELINE (normalize + classify) → per-source final ===
     log.info(f"\n{'='*50}")
     log.info(f"  STEP 2: PIPELINE (normalize + classify)")
     log.info(f"{'='*50}")
@@ -168,53 +175,31 @@ async def full_cycle(
         log.warning(f"AddressMapper failed: {e}")
         mapper = None
 
-    nhatot_clean = None
-    muaban_clean = None
+    final_files = []
     if nhatot_raw:
-        nhatot_clean = run_pipeline_for_source("nhatot", nhatot_raw, mapper)
+        final_files.append(("nhatot", run_pipeline_for_source("nhatot", nhatot_raw, mapper)))
     if muaban_raw:
-        muaban_clean = run_pipeline_for_source("muaban", muaban_raw, mapper)
+        final_files.append(("muaban", run_pipeline_for_source("muaban", muaban_raw, mapper)))
 
-    # === STEP 3: MERGE → 1 FINAL FILE ===
-    log.info(f"\n{'='*50}")
-    log.info(f"  STEP 3: MERGE → FINAL OUTPUT")
-    log.info(f"{'='*50}")
-
-    if nhatot_clean and muaban_clean:
-        run_merge(nhatot_clean, muaban_clean)
-    elif nhatot_clean or muaban_clean:
-        src_clean = nhatot_clean or muaban_clean
-        src_name = "nhatot" if nhatot_clean else "muaban"
-        fp = final_path()
-        with open(src_clean, encoding="utf-8") as f:
-            data = json.load(f)
-        with open(fp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        log.info(f"  Single source ({src_name}) → {fp}")
-    else:
-        log.error("No clean data to merge")
+    if not final_files:
+        log.error("No clean data produced")
         return None
 
     # === SUMMARY ===
     elapsed = int(time.time() - start)
-    final_file = find_latest_final()
+    log.info(f"\n{'#'*60}")
+    log.info(f"  CYCLE COMPLETE in {elapsed}s")
+    for src, fp in final_files:
+        with open(fp, encoding="utf-8") as f:
+            d = json.load(f)
+        log.info(
+            f"  [{src}] total={d.get('total', 0)}  "
+            f"phone_full={d.get('phone_full', 0)}"
+        )
+        log.info(f"         → {fp}")
+    log.info(f"{'#'*60}")
 
-    if final_file:
-        with open(final_file, encoding="utf-8") as f:
-            final_data = json.load(f)
-        total = final_data.get("total", len(final_data.get("listings", [])))
-        phones = final_data.get("phone_full", final_data.get("full_phone", 0))
-        quality = final_data.get("avg_quality", 0)
-
-        log.info(f"\n{'#'*60}")
-        log.info(f"  CYCLE COMPLETE in {elapsed}s")
-        log.info(f"  Total listings: {total}")
-        log.info(f"  Full phones:    {phones}")
-        log.info(f"  Avg quality:    {quality}")
-        log.info(f"  Output:         {final_file}")
-        log.info(f"{'#'*60}")
-
-    return final_file
+    return [fp for _, fp in final_files]
 
 
 async def loop(interval_min: int = 60, **kwargs):

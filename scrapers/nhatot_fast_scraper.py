@@ -36,7 +36,7 @@ import sys
 _pipeline_dir = str(Path(__file__).resolve().parent.parent / "pipeline")
 if _pipeline_dir not in sys.path:
     sys.path.insert(0, _pipeline_dir)
-from unified_pipeline import process_batch, AddressMapper, calc_quality_score
+from unified_pipeline import process_batch, AddressMapper
 
 try:
     import httpx
@@ -586,21 +586,17 @@ async def run_cycle(
         for dto in results:
             if not dto.phone_full:
                 dto.phone_full = phone_lookup.get(dto.source_id)
-                if dto.phone_full:
-                    dto.quality_score = calc_quality_score(dto)
 
     # Save
     from config import raw_path
     output_file = raw_path("nhatot")
 
     phones_found = sum(1 for r in results if r.phone_full)
-    avg_quality = sum(r.quality_score for r in results) / max(len(results), 1)
 
     output = {
         "source": "nhatot",
         "total": len(results),
         "full_phone": phones_found,
-        "avg_quality": round(avg_quality, 1),
         "cycle_time_sec": int(time.time() - start),
         "processed_at": datetime.now().isoformat(),
         "listings": [asdict(r) for r in results],
@@ -613,7 +609,6 @@ async def run_cycle(
     log.info(f"\n{'='*60}")
     log.info(f"  CYCLE DONE in {elapsed}s")
     log.info(f"  Total: {len(results)} | Phones: {phones_found}")
-    log.info(f"  Avg quality: {avg_quality:.0f}/100")
     log.info(f"  Saved: {output_file}")
     log.info(f"{'='*60}")
 

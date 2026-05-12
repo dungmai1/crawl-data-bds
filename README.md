@@ -44,8 +44,7 @@ Raw JSON
   → Price Validation
   → Property Classification
   → Broker Detection
-  → Quality Score
-  → PropertyDTO (35 fields)
+  → PropertyDTO (31 fields)
   → Cross-source merge (ward + price ±15% + area ±10%)
   → Final merged file
 ```

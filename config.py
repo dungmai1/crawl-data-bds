@@ -7,12 +7,10 @@ Data structure:
   │   ├── nhatot/2026-04-14/143000_raw.json
   │   ├── nhatot/2026-04-14/200000_raw.json    ← 2nd run same day
   │   ├── muaban/2026-04-14/143000_raw.json
-  ├── clean/                         Pipeline output
-  │   ├── nhatot/2026-04-14/143000_clean.json
-  │   └── muaban/2026-04-14/143000_clean.json
-  └── final/                         Merged output
-      ├── 2026-04-14/143000_merged.json
-      └── 2026-04-14/200000_merged.json        ← 2nd run same day
+  └── final/                         Pipeline output — normalized PropertyDTO, per source
+      ├── nhatot/2026-04-14/143000.json
+      ├── nhatot/2026-04-14/200000.json        ← 2nd run same day
+      └── muaban/2026-04-14/143000.json
 
 Naming rules:
   - Folder by date: YYYY-MM-DD
@@ -58,22 +56,13 @@ def raw_path(source: str, date: str = None) -> str:
     return str(path / f"{ts}_raw.json")
 
 
-def clean_path(source: str, date: str = None) -> str:
-    """data/clean/{source}/{date}/{HHMMSS}_clean.json"""
+def final_path(source: str, date: str = None) -> str:
+    """data/final/{source}/{date}/{HHMMSS}.json"""
     date = date or today()
     ts = _get_session_ts()
-    path = BASE_DIR / "data" / "clean" / source / date
+    path = BASE_DIR / "data" / "final" / source / date
     os.makedirs(path, exist_ok=True)
-    return str(path / f"{ts}_clean.json")
-
-
-def final_path(date: str = None) -> str:
-    """data/final/{date}/{HHMMSS}_merged.json"""
-    date = date or today()
-    ts = _get_session_ts()
-    path = BASE_DIR / "data" / "final" / date
-    os.makedirs(path, exist_ok=True)
-    return str(path / f"{ts}_merged.json")
+    return str(path / f"{ts}.json")
 
 
 def log_path(source: str, date: str = None) -> str:
@@ -99,27 +88,14 @@ def find_latest_raw(source: str):
     return None
 
 
-def find_latest_clean(source: str):
-    """Find the most recent clean file for a source."""
-    clean_dir = BASE_DIR / "data" / "clean" / source
-    if not clean_dir.exists():
-        return None
-    for date_dir in sorted(clean_dir.iterdir(), key=lambda d: d.name, reverse=True):
-        if date_dir.is_dir():
-            files = sorted(date_dir.glob("*_clean.json"), reverse=True)
-            if files:
-                return str(files[0])
-    return None
-
-
-def find_latest_final():
-    """Find the most recent merged file."""
-    final_dir = BASE_DIR / "data" / "final"
+def find_latest_final(source: str):
+    """Find the most recent final file for a source."""
+    final_dir = BASE_DIR / "data" / "final" / source
     if not final_dir.exists():
         return None
     for date_dir in sorted(final_dir.iterdir(), key=lambda d: d.name, reverse=True):
         if date_dir.is_dir():
-            files = sorted(date_dir.glob("*_merged.json"), reverse=True)
+            files = sorted(date_dir.glob("*.json"), reverse=True)
             if files:
                 return str(files[0])
     return None

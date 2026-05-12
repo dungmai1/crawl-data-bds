@@ -5,15 +5,16 @@ Chuẩn hóa data từ TẤT CẢ sources (nhatot, muaban, facebook) vào 1 DTO 
 Pipeline:
   Raw JSON → Source Adapter → Unified DTO → Address Mapping (34 tỉnh) →
   Price Validation → Property Classification → Broker Detection →
-  Quality Score → Clean JSON / DB Insert
+  Clean JSON / DB Insert
 
-Output DTO fields: 35 fields chuẩn, format thống nhất
+Output DTO fields: 31 fields chuẩn, format thống nhất
 """
 
 import json
 import re
 import os
 import logging
+import unicodedata
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from typing import Optional, List
@@ -22,7 +23,7 @@ from pathlib import Path
 log = logging.getLogger("pipeline")
 
 # ============================================================
-# UNIFIED DTO — 35 fields chuẩn cho mọi source
+# UNIFIED DTO — 31 fields chuẩn cho mọi source
 # ============================================================
 
 @dataclass
@@ -70,8 +71,8 @@ class PropertyDTO:
     bedrooms: Optional[int] = None
     bathrooms: Optional[int] = None
     floors: Optional[int] = None
-    direction: Optional[str] = None      # dong, tay, nam, bac, dong-nam...
-    legal_document: Optional[str] = None # so-hong, hop-dong, giay-phep-xd, khac
+    direction: Optional[str] = None      # "Đông", "Tây", "Nam", "Bắc", "Đông Nam"... (see DIRECTION_MAP)
+    legal_document: Optional[str] = None # "Sổ hồng", "Hợp đồng mua bán", "Giấy phép xây dựng", "Giấy tờ hợp lệ", "Khác" (see LEGAL_MAP)
 
     # Contact
     phone_full: Optional[str] = None     # Full 10 digits
@@ -87,7 +88,6 @@ class PropertyDTO:
     # Metadata
     posted_at: Optional[str] = None      # ISO 8601
     scraped_at: str = ""                 # ISO 8601
-    quality_score: int = 0               # 0-100
 
 
 # ============================================================
@@ -227,8 +227,72 @@ NHATOT_LAND_MAP = {            # cat=1040, field: land_type
 FARMSTAY_RE = re.compile(r'\b(farmstay|homestay|nghỉ dưỡng|resort|trang trại)\b', re.IGNORECASE)
 LIEN_KE_RE  = re.compile(r'\b(liền kề|liên kế|liền\s+k[ềê])\b', re.IGNORECASE)
 
-DIRECTION_MAP = {1: "dong", 2: "tay", 3: "nam", 4: "bac", 5: "dong-bac", 6: "dong-nam", 7: "tay-bac", 8: "tay-nam"}
-LEGAL_MAP = {1: "so-hong", 2: "hop-dong", 3: "giay-phep-xd", 4: "dang-cho-so", 5: "khac"}
+# direction / legal_document are stored as Vietnamese display strings (a canonical
+# casing/spelling), not slugs — same vocabulary across nhatot + muaban.
+DIRECTION_MAP = {1: "Đông", 2: "Tây", 3: "Nam", 4: "Bắc", 5: "Đông Bắc", 6: "Đông Nam", 7: "Tây Bắc", 8: "Tây Nam"}
+# 1-5 from chotot's property_legal_document codes; 6 = "Giấy tờ hợp lệ" (nhatot code unverified —
+# muaban exposes this value as free text and it's the canonical form there).
+LEGAL_MAP = {1: "Sổ hồng", 2: "Hợp đồng mua bán", 3: "Giấy phép xây dựng", 4: "Đang chờ sổ", 5: "Khác", 6: "Giấy tờ hợp lệ"}
+
+# muaban detail pages expose direction / legal as free Vietnamese text — normalize the
+# casing/spelling to the canonical form. Keys are accent-stripped lowercase (see _vn_norm).
+MUABAN_DIRECTION_MAP = {
+    "dong": "Đông", "tay": "Tây", "nam": "Nam", "bac": "Bắc",
+    "dong bac": "Đông Bắc", "dong nam": "Đông Nam",
+    "tay bac": "Tây Bắc", "tay nam": "Tây Nam",
+}
+MUABAN_LEGAL_MAP = {
+    "so hong": "Sổ hồng", "so do": "Sổ hồng",          # sổ đỏ gộp vào sổ hồng
+    "so hong rieng": "Sổ hồng", "so do rieng": "Sổ hồng",
+    "hop dong": "Hợp đồng mua bán", "hop dong mua ban": "Hợp đồng mua bán",
+    "giay phep xay dung": "Giấy phép xây dựng",
+    "dang cho so": "Đang chờ sổ", "cho so": "Đang chờ sổ",
+    "giay to hop le": "Giấy tờ hợp lệ",
+}
+
+def _vn_norm(text: str) -> str:
+    """Lowercase, strip, drop Vietnamese accents — for keying the maps above."""
+    if not text:
+        return ""
+    t = unicodedata.normalize("NFD", text.strip().lower())
+    t = "".join(c for c in t if unicodedata.category(c) != "Mn")  # drop combining marks
+    return t.replace("đ", "d")
+
+
+def _parse_int_field(value) -> Optional[int]:
+    """Coerce a possibly-stringy field (e.g. floors="2", "34/35") to int; junk → None."""
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    m = re.search(r"\d+", str(value))
+    return int(m.group()) if m else None
+
+
+def _normalize_vn_direction(text: Optional[str]) -> Optional[str]:
+    """muaban direction text → canonical Vietnamese label ("Đông Nam"); unknown → None."""
+    return MUABAN_DIRECTION_MAP.get(_vn_norm(text)) if text else None
+
+
+def _normalize_muaban_legal(text: Optional[str]) -> Optional[str]:
+    """Known forms → canonical Vietnamese label (matching LEGAL_MAP values); anything
+    else passes through verbatim (stripped) so values like "Vi bằng" aren't lost to "Khác"."""
+    if not text:
+        return None
+    t = _vn_norm(text)
+    if t in MUABAN_LEGAL_MAP:
+        return MUABAN_LEGAL_MAP[t]
+    if "so hong" in t or "so do" in t or "shr" in t:
+        return "Sổ hồng"
+    if "hop dong" in t:
+        return "Hợp đồng mua bán"
+    if "giay phep" in t:
+        return "Giấy phép xây dựng"
+    if "cho so" in t:
+        return "Đang chờ sổ"
+    if "giay to hop le" in t:
+        return "Giấy tờ hợp lệ"
+    return text.strip()
 
 MUABAN_CAT_MAP = {
     "Nhà hẻm ngõ": "nha-o",
@@ -433,17 +497,23 @@ def adapt_muaban(raw: dict) -> PropertyDTO:
     price = raw.get("price")
     ppm2 = round(price / area) if price and area and area > 0 else None
 
-    # Images
-    imgs = raw.get("covers", [])
+    # Images: prefer the enriched full-res gallery (`images`, added by the
+    # scraper detail pass); `covers` from the listing API holds only 1 thumbnail.
+    imgs = raw.get("images") or raw.get("covers") or []
     if isinstance(imgs, list):
         imgs = [i for i in imgs if isinstance(i, str) and i.startswith("http")]
+    else:
+        imgs = []
 
-    # Phone
-    phone_full = raw.get("phone")
-    phone_display = raw.get("phone_display")
-    # Normalize phone
+    # Phone — listing API gives `phone`; detail pass may add `phone_full` as fallback
+    phone_full = raw.get("phone") or raw.get("phone_full")
     if phone_full:
         phone_full = re.sub(r'[\s.\-]', '', phone_full)
+
+    # Enriched detail-pass fields (added by muaban_scraper.enrich_detail_data).
+    # Absent on un-enriched items → stay None.
+    street = (raw.get("street") or "").strip() or None
+    contact_name = (raw.get("contact_name") or "").strip() or None
 
     return PropertyDTO(
         source="muaban",
@@ -459,24 +529,25 @@ def adapt_muaban(raw: dict) -> PropertyDTO:
         area=area,
         province=province_raw,
         ward=ward_raw,
+        street=street,
         district_legacy=district_raw,
-        lat=None,  # muaban doesn't provide lat/lng in listing API
-        lng=None,
+        # muaban exposes no coordinates anywhere → leave lat/lng NULL
         bedrooms=bedrooms,
         bathrooms=bathrooms,
-        direction=None,  # muaban doesn't provide
-        legal_document=None,  # muaban doesn't provide
+        floors=_parse_int_field(raw.get("floors")),
+        direction=_normalize_vn_direction(raw.get("direction")),
+        legal_document=_normalize_muaban_legal(raw.get("legal_document")),
         phone_full=phone_full,
-        contact_name=None,
+        contact_name=contact_name,
         images=imgs,
-        image_count=raw.get("total_images", 0),
+        image_count=raw.get("image_count") or len(imgs) or raw.get("total_images", 0),
         posted_at=raw.get("publish_at"),
         scraped_at=datetime.now().isoformat(),
     )
 
 
 # ============================================================
-# VALIDATION + QUALITY SCORE
+# VALIDATION
 # ============================================================
 
 def validate_price(dto: PropertyDTO):
@@ -520,24 +591,6 @@ def classify_poster(dto: PropertyDTO, raw: dict):
     else: dto.poster_type = "khong_xac_dinh"
 
 
-def calc_quality_score(dto: PropertyDTO) -> int:
-    """Calculate 0-100 quality score."""
-    s = 0
-    checks = [
-        (dto.title, 10), (dto.price, 15), (dto.area, 15),
-        (dto.province, 10), (dto.ward, 5), (dto.street, 5),
-        (dto.lat and dto.lng, 8),
-        (dto.images and len(dto.images) > 0, 5),
-        (dto.description and len(dto.description) > 50, 5),
-        (dto.bedrooms, 3), (dto.bathrooms, 3),
-        (dto.legal_document, 3), (dto.direction, 2),
-        (dto.phone_full, 10),
-    ]
-    for val, pts in checks:
-        if val: s += pts
-    return min(s, 100)
-
-
 # ============================================================
 # FULL PIPELINE
 # ============================================================
@@ -575,13 +628,7 @@ def process_batch(raw_items: list, source: str, address_mapper: AddressMapper = 
         # Step 4: Classify poster
         classify_poster(dto, raw)
 
-        # Step 5: Quality score
-        dto.quality_score = calc_quality_score(dto)
-
         results.append(dto)
-
-    # Sort by quality
-    results.sort(key=lambda x: x.quality_score, reverse=True)
 
     return results
 
@@ -605,36 +652,26 @@ def run_pipeline(source: str, input_file: str, output_file: str = None):
     # Stats
     total = len(results)
     has_phone = sum(1 for r in results if r.phone_full)
-    avg_quality = sum(r.quality_score for r in results) / max(total, 1)
 
     log.info(f"\n{'='*60}")
     log.info(f"  PIPELINE RESULTS — {source}")
     log.info(f"{'='*60}")
     log.info(f"  Total:        {total}")
     log.info(f"  Full phone:   {has_phone} ({has_phone/max(total,1)*100:.0f}%)")
-    log.info(f"  Avg quality:  {avg_quality:.0f}/100")
-
-    # Quality distribution
-    excellent = sum(1 for r in results if r.quality_score >= 80)
-    good = sum(1 for r in results if 60 <= r.quality_score < 80)
-    fair = sum(1 for r in results if 40 <= r.quality_score < 60)
-    poor = sum(1 for r in results if r.quality_score < 40)
-    log.info(f"  Quality: Excellent={excellent} Good={good} Fair={fair} Poor={poor}")
 
     # Save
     if not output_file:
         import sys as _sys
         _cfg = str(Path(__file__).resolve().parent.parent)
         if _cfg not in _sys.path: _sys.path.insert(0, _cfg)
-        from config import clean_path
-        output_file = clean_path(source)
+        from config import final_path
+        output_file = final_path(source)
 
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump({
             "source": source,
             "total": total,
             "full_phone": has_phone,
-            "avg_quality": round(avg_quality, 1),
             "processed_at": datetime.now().isoformat(),
             "listings": [asdict(r) for r in results],
         }, f, ensure_ascii=False, indent=2)
