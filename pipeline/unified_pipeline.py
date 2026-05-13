@@ -53,6 +53,8 @@ class PropertyDTO:
 
     # Area
     area: Optional[float] = None         # m2
+    width: Optional[float] = None        # Chiều ngang / mặt tiền (m)
+    length: Optional[float] = None       # Chiều dài (m)
 
     # Address (NEW 34-province system)
     province: Optional[str] = None       # Tỉnh/TP mới (post 01/07/2025)
@@ -259,6 +261,18 @@ def _vn_norm(text: str) -> str:
     return t.replace("đ", "d")
 
 
+def _clean_dimension(value) -> Optional[float]:
+    """nhatot exposes user-entered `width`/`length` (m) — coerce to float, drop junk
+    (<=0, or absurdly large values from people typing area into the wrong field)."""
+    if value is None:
+        return None
+    try:
+        f = round(float(value), 2)
+    except (TypeError, ValueError):
+        return None
+    return f if 0 < f <= 1000 else None
+
+
 def _parse_int_field(value) -> Optional[int]:
     """Coerce a possibly-stringy field (e.g. floors="2", "34/35") to int; junk → None."""
     if value is None:
@@ -435,6 +449,8 @@ def adapt_nhatot(raw: dict) -> PropertyDTO:
         price_display=raw.get("price_string", ""),
         price_per_m2=round(raw["price"] / raw["size"]) if raw.get("price") and raw.get("size") and raw["size"] > 0 else None,
         area=raw.get("size"),
+        width=_clean_dimension(raw.get("width")),
+        length=_clean_dimension(raw.get("length")),
         province=raw.get("region_name", ""),
         ward=raw.get("ward_name", ""),
         street=raw.get("street_name", ""),
@@ -560,9 +576,15 @@ def validate_price(dto: PropertyDTO):
 
 def classify_poster(dto: PropertyDTO, raw: dict):
     """Detect broker vs owner."""
+    # nhatot: API trả `company_ad` cho tin do công ty/môi giới đăng.
+    # Có trường này (truthy) ⇒ môi giới; không có ⇒ cá nhân.
+    if dto.source == "nhatot":
+        dto.poster_type = "moi_gioi" if raw.get("company_ad") else "chu_nha"
+        return
+
+    # muaban (và các source khác): heuristic scoring — giữ logic hiện tại
     score = 0
 
-    # nhatot-specific signals
     sold = raw.get("sold_ads", 0)
     company = raw.get("company_ad", False) or raw.get("is_company", False)
 

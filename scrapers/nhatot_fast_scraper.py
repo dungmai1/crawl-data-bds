@@ -637,7 +637,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="V-Nexus Nhatot Fast Scraper")
-    parser.add_argument("--count", type=int, default=500, help="Max listings per cycle")
+    parser.add_argument("--count", type=int, default=200, help="Max listings per cycle")
     parser.add_argument("--tabs", type=int, default=5, help="Parallel browser tabs")
     parser.add_argument("--batch-size", type=int, default=50, help="Phone reveal batch size before cooldown")
     parser.add_argument("--api-only", action="store_true", help="Only API, no phone reveal")

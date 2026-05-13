@@ -1,11 +1,13 @@
 """
 V-Nexus: Master Scraper Runner
 1 lệnh: cào nhatot + muaban → lọc (normalize/classify) → ghi file final riêng từng nguồn
+→ upload ảnh lên Cloudflare R2 (thay URL gốc bằng URL R2 trong từng file final)
 
 Usage:
-    python run.py                          # Full cycle: cào cả 2 + lọc
+    python run.py                          # Full cycle: cào cả 2 + lọc + upload ảnh
     python run.py --nhatot-only            # Chỉ cào nhatot
     python run.py --muaban-only            # Chỉ cào muaban
+    python run.py --skip-upload            # Bỏ qua bước upload ảnh lên R2
     python run.py --loop --interval 60     # Chạy liên tục mỗi 60 phút
 
 Output (per source, no merge):
@@ -39,7 +41,7 @@ log = logging.getLogger("runner")
 
 
 async def scrape_nhatot(
-    count: int = 200,
+    count: int = 500,
     tabs: int = 5,
     batch_size: int = 50,
     region: int = 13000,
@@ -55,7 +57,7 @@ async def scrape_nhatot(
     return result.get("file") if isinstance(result, dict) else None
 
 
-async def scrape_muaban(per_city: int = 500, category: str = "all") -> str:
+async def scrape_muaban(per_city: int = 200, category: str = "all") -> str:
     """Run muaban scraper. Returns output file path."""
     from muaban_scraper import run_cycle as muaban_cycle
     result = await muaban_cycle(per_city=per_city, category=category)
@@ -109,13 +111,14 @@ def run_pipeline_for_source(source: str, input_file: str, mapper: AddressMapper)
 async def full_cycle(
     nhatot_only: bool = False,
     muaban_only: bool = False,
-    nhatot_count: int = 200,
+    nhatot_count: int = 500,
     nhatot_tabs: int = 5,
     nhatot_batch_size: int = 50,
-    muaban_per_city: int = 500,
+    muaban_per_city: int = 200,
     muaban_category: str = "all",
+    skip_upload: bool = False,
 ):
-    """Full cycle: scrape → pipeline → per-source final output."""
+    """Full cycle: scrape → pipeline → per-source final output → R2 image upload."""
     reset_session()
     start = time.time()
 
@@ -185,6 +188,23 @@ async def full_cycle(
         log.error("No clean data produced")
         return None
 
+    # === STEP 3: UPLOAD IMAGES → CLOUDFLARE R2 ===
+    if not skip_upload:
+        log.info(f"\n{'='*50}")
+        log.info(f"  STEP 3: UPLOAD IMAGES → CLOUDFLARE R2")
+        log.info(f"{'='*50}")
+        try:
+            from image_uploader import upload_all_in_final_file
+            for src, fp in final_files:
+                stats = await upload_all_in_final_file(fp)
+                log.info(
+                    f"  [{src}] images: {stats['uploaded']} uploaded, "
+                    f"{stats['skipped']} skipped (already in R2), "
+                    f"{stats['failed']} failed / {stats['total_images']} total"
+                )
+        except Exception as e:
+            log.error(f"  Image upload skipped: {e} — final files retain original URLs")
+
     # === SUMMARY ===
     elapsed = int(time.time() - start)
     log.info(f"\n{'#'*60}")
@@ -225,10 +245,11 @@ if __name__ == "__main__":
     parser.add_argument("--nhatot-count", type=int, default=500, help="Nhatot listings count")
     parser.add_argument("--nhatot-tabs", type=int, default=5, help="Nhatot browser tabs")
     parser.add_argument("--nhatot-batch-size", type=int, default=50, help="Nhatot phone reveal batch size")
-    parser.add_argument("--muaban-per-city", type=int, default=500, help="Muaban listings per city")
+    parser.add_argument("--muaban-per-city", type=int, default=200, help="Muaban listings per city")
     parser.add_argument("--muaban-category", default="all", help="Muaban subcategory (e.g. dat-tho-cu). Default: all")
     parser.add_argument("--loop", action="store_true", help="Run continuously")
     parser.add_argument("--interval", type=int, default=60, help="Loop interval (minutes)")
+    parser.add_argument("--skip-upload", action="store_true", help="Skip uploading images to Cloudflare R2")
     args = parser.parse_args()
 
     if args.loop:
@@ -241,6 +262,7 @@ if __name__ == "__main__":
             nhatot_batch_size=args.nhatot_batch_size,
             muaban_per_city=args.muaban_per_city,
             muaban_category=args.muaban_category,
+            skip_upload=args.skip_upload,
         ))
     else:
         asyncio.run(full_cycle(
@@ -251,4 +273,5 @@ if __name__ == "__main__":
             nhatot_batch_size=args.nhatot_batch_size,
             muaban_per_city=args.muaban_per_city,
             muaban_category=args.muaban_category,
+            skip_upload=args.skip_upload,
         ))
