@@ -45,6 +45,7 @@ async def scrape_nhatot(
     tabs: int = 5,
     batch_size: int = 50,
     region: int = 13000,
+    transaction: str = "both",
 ) -> str:
     """Run nhatot scraper. Returns output file path."""
     from nhatot_fast_scraper import run_cycle
@@ -53,6 +54,7 @@ async def scrape_nhatot(
         num_tabs=tabs,
         batch_size=batch_size,
         region=region,
+        transaction=transaction,
     )
     return result.get("file") if isinstance(result, dict) else None
 
@@ -114,6 +116,7 @@ async def full_cycle(
     nhatot_count: int = 500,
     nhatot_tabs: int = 5,
     nhatot_batch_size: int = 50,
+    nhatot_transaction: str = "both",
     muaban_per_city: int = 200,
     muaban_category: str = "all",
     skip_upload: bool = False,
@@ -144,6 +147,7 @@ async def full_cycle(
                 count=nhatot_count,
                 tabs=nhatot_tabs,
                 batch_size=nhatot_batch_size,
+                transaction=nhatot_transaction,
             )
             log.info(f"  [nhatot] Done → {nhatot_raw}")
         except Exception as e:
@@ -245,6 +249,12 @@ if __name__ == "__main__":
     parser.add_argument("--nhatot-count", type=int, default=500, help="Nhatot listings count")
     parser.add_argument("--nhatot-tabs", type=int, default=5, help="Nhatot browser tabs")
     parser.add_argument("--nhatot-batch-size", type=int, default=50, help="Nhatot phone reveal batch size")
+    parser.add_argument(
+        "--nhatot-transaction",
+        choices=["ban", "cho-thue", "both"],
+        default="both",
+        help="Nhatot transaction type: ban | cho-thue | both (default: both)",
+    )
     parser.add_argument("--muaban-per-city", type=int, default=200, help="Muaban listings per city")
     parser.add_argument("--muaban-category", default="all", help="Muaban subcategory (e.g. dat-tho-cu). Default: all")
     parser.add_argument("--loop", action="store_true", help="Run continuously")
@@ -260,6 +270,7 @@ if __name__ == "__main__":
             nhatot_count=args.nhatot_count,
             nhatot_tabs=args.nhatot_tabs,
             nhatot_batch_size=args.nhatot_batch_size,
+            nhatot_transaction=args.nhatot_transaction,
             muaban_per_city=args.muaban_per_city,
             muaban_category=args.muaban_category,
             skip_upload=args.skip_upload,
@@ -271,6 +282,7 @@ if __name__ == "__main__":
             nhatot_count=args.nhatot_count,
             nhatot_tabs=args.nhatot_tabs,
             nhatot_batch_size=args.nhatot_batch_size,
+            nhatot_transaction=args.nhatot_transaction,
             muaban_per_city=args.muaban_per_city,
             muaban_category=args.muaban_category,
             skip_upload=args.skip_upload,

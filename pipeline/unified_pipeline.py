@@ -43,7 +43,7 @@ class PropertyDTO:
     # dat-tho-cu | dat-nen-du-an | dat-nong-nghiep |
     # trang-trai-khu-nghi-duong | kho-nha-xuong | loai-bds-khac
     property_type: Optional[str] = None
-    transaction_type: str = "ban"        # ban | cho-thue | sang-nhuong
+    transaction_type: str = "ban"        # ban | cho-thue
 
     # Price
     price: Optional[int] = None          # VND
@@ -432,10 +432,11 @@ def adapt_nhatot(raw: dict) -> PropertyDTO:
     if phone_full:
         phone_full = re.sub(r'[\s.\-]', '', phone_full)
 
-    # Build source URL from list_id
+    # Build source URL from list_id — prefix theo loại giao dịch để khớp section thật
     list_id = raw.get("list_id", "")
     region_slug = raw.get("region_name", "").lower().replace(" ", "-")
-    source_url = f"https://www.nhatot.com/mua-ban-{region_slug}/{list_id}.htm" if list_id else None
+    section = "cho-thue" if tx == "cho-thue" else "mua-ban"
+    source_url = f"https://www.nhatot.com/{section}-{region_slug}/{list_id}.htm" if list_id else None
 
     return PropertyDTO(
         source="nhatot",

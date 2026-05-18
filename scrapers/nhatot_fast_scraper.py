@@ -115,6 +115,15 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 }
 
+# Chotot gateway phân biệt sale vs rent qua query param `st`:
+#   st=s → mua bán (ad.type='s')
+#   st=u → cho thuê (ad.type='u')
+# Categories DÙNG CHUNG cho cả 2 mode: 1010 Chung cư, 1020 Nhà ở, 1030 VP/MB, 1040 Đất.
+# Riêng 1050 (Phòng trọ) chỉ tồn tại ở mode cho thuê.
+SALE_CATEGORIES = [1020, 1010, 1040, 1030]
+RENT_CATEGORIES = [1020, 1010, 1040, 1030, 1050]
+ST_BY_TRANSACTION = {"ban": "s", "cho-thue": "u"}
+
 # ===========================================================
 # TẦNG 1: API SCRAPER (NHANH — ~3000 listings/phút)
 # ===========================================================
@@ -124,14 +133,17 @@ async def scrape_api_batch(
     max_listings: int = 200,
     categories: list = None,
     offset_shift: int = 0,
+    transaction_type: str = "ban",
 ) -> list[dict]:
     """Cào listings từ gateway API. Async, nhanh, không cần browser.
 
+    transaction_type: "ban" (mua bán) | "cho-thue" — chọn category mặc định
     offset_shift: cộng thêm vào offset để lấy page ads khác (cho accumulator mode).
     """
 
     if categories is None:
-        categories = [1020, 1010, 1040, 1030]  # Nhà ở, Chung cư, Đất, Văn phòng/Mặt bằng
+        categories = RENT_CATEGORIES if transaction_type == "cho-thue" else SALE_CATEGORIES
+    st = ST_BY_TRANSACTION.get(transaction_type, "s")
 
     async with httpx.AsyncClient(headers=HEADERS, timeout=15) as client:
         tasks = []
@@ -142,7 +154,7 @@ async def scrape_api_batch(
                 real_offset = offset + offset_shift
                 url = (
                     f"https://gateway.chotot.com/v1/public/ad-listing"
-                    f"?cg={cg}&limit=50&o={real_offset}&st=s&region_v2={region}"
+                    f"?cg={cg}&limit=50&o={real_offset}&st={st}&region_v2={region}"
                 )
                 tasks.append((cg, real_offset, client.get(url)))
 
@@ -191,8 +203,23 @@ async def scrape_api_batch(
                     dist[cg] += 1
                     break
 
-    log.info(f"API: {len(all_ads)} unique listings — per-cat: {dist}")
+    log.info(f"API [{transaction_type}]: {len(all_ads)} unique listings — per-cat: {dist}")
     return all_ads
+
+
+def _build_detail_url(ad: dict) -> str:
+    """Build nhatot detail URL theo loại giao dịch (slug đúng path tránh redirect).
+
+    Cho thuê: cho-thue-nha-dat-{district}-tp-ho-chi-minh
+    Mua bán: mua-ban-nha-dat-{district}-tp-ho-chi-minh
+    Slug chỉ cần khớp section (sale/rent) — server tìm listing bằng list_id.
+    """
+    list_id = ad.get("list_id", "")
+    district = _vn_slug(ad.get("area_name", ""))
+    # Pipeline gán cho-thue khi raw["type"] in ("k","u") — match đây để consistent
+    is_rent = ad.get("type") in ("k", "u")
+    prefix = "cho-thue-nha-dat" if is_rent else "mua-ban-nha-dat"
+    return f"https://www.nhatot.com/{prefix}-{district}-tp-ho-chi-minh/{list_id}.htm"
 
 
 async def enrich_with_detail(ads: list[dict], max_concurrent: int = 10) -> list[dict]:
@@ -347,12 +374,8 @@ async def _process_phone_batch(
                 title = ad.get("subject", "")[:35]
                 # `total` đã được pass vào từ caller
 
-                # Get URL
-                detail_url = url_map.get(list_id)
-                if not detail_url:
-                    # Slug không dấu + đúng path "mua-ban-nha-dat" để khỏi bị server redirect
-                    district = _vn_slug(ad.get("area_name", ""))
-                    detail_url = f"https://www.nhatot.com/mua-ban-nha-dat-{district}-tp-ho-chi-minh/{list_id}.htm"
+                # Get URL — fallback chọn slug theo loại giao dịch để khỏi bị redirect
+                detail_url = url_map.get(list_id) or _build_detail_url(ad)
 
                 phone_found = None
                 phone_api_status = None
@@ -531,20 +554,34 @@ async def run_cycle(
     api_only: bool = False,
     region: int = 13000,
     offset_shift: int = 0,
+    transaction: str = "both",
 ):
-    """Chạy 1 chu kỳ cào: API + Phone reveal."""
+    """Chạy 1 chu kỳ cào: API + Phone reveal.
+
+    transaction: "ban" | "cho-thue" | "both" — chia max_listings cho từng loại khi "both".
+    """
 
     start = time.time()
     log.info(f"\n{'='*60}")
     log.info(f"  CYCLE START — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log.info(
         f"  Listings: {max_listings} | Tabs: {num_tabs} | Batch size: {batch_size} | "
-        f"API-only: {api_only} | Offset shift: {offset_shift}"
+        f"API-only: {api_only} | Offset shift: {offset_shift} | Transaction: {transaction}"
     )
     log.info(f"{'='*60}")
 
-    # Tầng 1: API
-    ads = await scrape_api_batch(region=region, max_listings=max_listings, offset_shift=offset_shift)
+    # Tầng 1: API — scrape từng loại giao dịch yêu cầu, chia đều quota
+    tx_list = ["ban", "cho-thue"] if transaction == "both" else [transaction]
+    per_tx = max(max_listings // len(tx_list), 1)
+    ads: list[dict] = []
+    for tx in tx_list:
+        batch = await scrape_api_batch(
+            region=region,
+            max_listings=per_tx,
+            offset_shift=offset_shift,
+            transaction_type=tx,
+        )
+        ads.extend(batch)
     ads = await enrich_with_detail(ads, max_concurrent=10)
 
     # Tầng 2: Phone (nếu không phải api-only)
@@ -645,6 +682,12 @@ if __name__ == "__main__":
     parser.add_argument("--loop", action="store_true", help="Run continuously every hour")
     parser.add_argument("--interval", type=int, default=60, help="Loop interval in minutes")
     parser.add_argument("--offset-shift", type=int, default=0, help="Offset shift (advance past already-scraped ads)")
+    parser.add_argument(
+        "--transaction",
+        choices=["ban", "cho-thue", "both"],
+        default="both",
+        help="Loại giao dịch crawl: ban | cho-thue | both (default: both — chia đều quota)",
+    )
 
     args = parser.parse_args()
 
@@ -655,6 +698,7 @@ if __name__ == "__main__":
             num_tabs=args.tabs,
             batch_size=args.batch_size,
             region=args.region,
+            transaction=args.transaction,
         ))
     else:
         asyncio.run(run_cycle(
@@ -664,4 +708,5 @@ if __name__ == "__main__":
             api_only=args.api_only,
             region=args.region,
             offset_shift=args.offset_shift,
+            transaction=args.transaction,
         ))
