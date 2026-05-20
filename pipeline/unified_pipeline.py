@@ -15,12 +15,23 @@ import re
 import os
 import logging
 import unicodedata
+from collections import Counter, defaultdict
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from typing import Optional, List
 from pathlib import Path
 
 log = logging.getLogger("pipeline")
+
+# Phone-history lookup — optional, falls back gracefully if DB not configured
+try:
+    from phone_history import get_phone_history_counts, normalize_phone as _normalize_phone_db
+except ImportError:  # phone_history.py sits in same package; supports both run modes
+    try:
+        from .phone_history import get_phone_history_counts, normalize_phone as _normalize_phone_db  # type: ignore
+    except Exception:
+        get_phone_history_counts = None  # type: ignore
+        _normalize_phone_db = None  # type: ignore
 
 # ============================================================
 # UNIFIED DTO — 31 fields chuẩn cho mọi source
@@ -84,8 +95,15 @@ class PropertyDTO:
     images: List[str] = field(default_factory=list)
     image_count: int = 0
 
-    # Poster classification
-    poster_type: Optional[str] = None    # moi_gioi | chu_nha | khong_xac_dinh
+    # Poster classification — các field dưới CHỈ phục vụ JSON output (luồng run.py).
+    # Luồng DB (scheduler/) KHÔNG đọc chúng: cột data_sources.poster_type được
+    # classify riêng ở classification.poster sau khi upsert.
+    poster_type: Optional[str] = None    # moi_gioi | chu_nha
+
+    # Poster classification (new — BROKER/OWNER + confidence + reasons)
+    owner_type: Optional[str] = None     # BROKER | OWNER
+    confidence_score: float = 0.0        # ∈ [0,1] về nhãn đã chọn
+    reason: List[str] = field(default_factory=list)  # giải thích Vietnamese
 
     # Metadata
     posted_at: Optional[str] = None      # ISO 8601
@@ -575,63 +593,197 @@ def validate_price(dto: PropertyDTO):
         dto.price = None
 
 
-def classify_poster(dto: PropertyDTO, raw: dict):
-    """Detect broker vs owner."""
-    # nhatot: API trả `company_ad` cho tin do công ty/môi giới đăng.
-    # Có trường này (truthy) ⇒ môi giới; không có ⇒ cá nhân.
-    if dto.source == "nhatot":
-        dto.poster_type = "moi_gioi" if raw.get("company_ad") else "chu_nha"
-        return
+# ============================================================
+# CLASSIFIER — weighted scoring, BROKER/OWNER + confidence + reasons
+# ============================================================
 
-    # muaban (và các source khác): heuristic scoring — giữ logic hiện tại
-    score = 0
+# Phone-history thresholds (CÙNG SOURCE — không gộp cross-source)
+PHONE_THRESHOLD = 3        # > 3 lần cùng source → strong broker signal
+PHONE_WEAK_THRESHOLD = 1   # > 1 → weak hint
 
-    sold = raw.get("sold_ads", 0)
-    company = raw.get("company_ad", False) or raw.get("is_company", False)
+# Signal weights
+W_PHONE_STRONG = 0.50
+W_PHONE_WEAK = 0.15
+W_COMPANY_FLAG = 0.45      # nhatot.company_ad / muaban.is_company
+W_NAME_KW = 0.30
+W_DESC_BROKER_KW = 0.20
+W_SOLD_HIGH = 0.30         # muaban sold_ads >= 20
+W_SOLD_MID = 0.15          # muaban sold_ads >= 5
+W_OWNER_KW = -0.25         # "chính chủ", "không trung gian" trong title/desc
+W_OWNER_NO_HISTORY = -0.15 # phone chưa từng xuất hiện cùng source
 
-    if sold >= 50: score += 5
-    elif sold >= 20: score += 3
-    elif sold >= 5: score += 2
-    elif sold == 0: score -= 1
+BROKER_THRESHOLD = 0.40
 
-    if company: score += 2
-    else: score -= 2
+_NAME_BROKER_KW = ["bds", "bất động sản", "land", "nhà đất", "chuyên", "địa ốc",
+                   "môi giới", "broker", "sale", "sales", "công ty"]
+_DESC_BROKER_KW = ["hoa hồng", "hotline", "chuyên bán", "cam kết", "nhận ký gửi",
+                   "hỗ trợ vay", "tư vấn miễn phí", "quỹ căn", "giỏ hàng"]
+_OWNER_KW = ["chính chủ", "không trung gian", "không qua môi giới"]
 
-    # Name keywords
+
+def classify_poster(
+    dto: PropertyDTO,
+    raw: dict,
+    db_phone_history: Optional[dict] = None,
+    in_cycle_phone_count: int = 0,
+):
+    """Phân loại tin đăng là môi giới hay chủ nhà — weighted scoring.
+
+    Set 4 field trên DTO:
+      - owner_type:       "BROKER" | "OWNER"
+      - confidence_score: ∈ [0,1] về nhãn đã chọn
+      - reason:           list giải thích Vietnamese
+      - poster_type:      "moi_gioi" | "chu_nha" — derived từ owner_type.
+                          Chỉ dùng cho JSON output; luồng DB classify lại riêng
+                          ở classification.poster (không đọc field này).
+
+    Tham số:
+      db_phone_history: optional dict {(source, phone): count} — preloaded
+        từ `phone_history.get_phone_history_counts`. None = bỏ qua DB signal.
+      in_cycle_phone_count: số tin KHÁC trong run hiện tại cùng (source, phone).
+        Caller có trách nhiệm tính (build Counter trong process_batch).
+
+    Lưu ý: việc check phone history CHỈ trong cùng source (`dto.source`) —
+    không gộp giữa nhatot và muaban (theo yêu cầu phân loại).
+    """
+    score = 0.0
+    reasons: list[str] = []
+
+    # ===== S1: Phone history cùng source (DB + in-cycle) =====
+    phone = (_normalize_phone_db(dto.phone_full) if _normalize_phone_db else dto.phone_full)
+    if phone:
+        db_count = 0
+        if db_phone_history is not None:
+            db_count = db_phone_history.get((dto.source, phone), 0)
+        total = max(0, in_cycle_phone_count) + db_count
+
+        if total > PHONE_THRESHOLD:
+            score += W_PHONE_STRONG
+            reasons.append(
+                f"S1.phone đăng {total} tin trong source `{dto.source}` "
+                f"(DB={db_count}, in-cycle khác={in_cycle_phone_count}) — > {PHONE_THRESHOLD}"
+            )
+        elif total > PHONE_WEAK_THRESHOLD:
+            score += W_PHONE_WEAK
+            reasons.append(
+                f"S1w.phone xuất hiện {total} lần cùng source `{dto.source}` "
+                f"(DB={db_count}, in-cycle khác={in_cycle_phone_count})"
+            )
+        elif total == 0:
+            score += W_OWNER_NO_HISTORY
+            reasons.append(
+                f"O1.phone chưa có lịch sử trong source `{dto.source}` → thiên hướng chủ nhà"
+            )
+
+    # ===== S3: Explicit API broker flag =====
+    is_company = bool(raw.get("company_ad") or raw.get("is_company"))
+    if is_company:
+        score += W_COMPANY_FLAG
+        reasons.append("S3.cờ broker từ API (company_ad / is_company)")
+
+    # ===== S2 (muaban-specific): sold_ads tier =====
+    sold = raw.get("sold_ads", 0) or 0
+    if sold >= 20:
+        score += W_SOLD_HIGH
+        reasons.append(f"S2.sold_ads={sold} (>=20)")
+    elif sold >= 5:
+        score += W_SOLD_MID
+        reasons.append(f"S2w.sold_ads={sold} (>=5)")
+
+    # ===== T1: contact_name keyword =====
     name = (dto.contact_name or "").lower()
-    if any(kw in name for kw in ["bds", "bất động sản", "land", "nhà đất", "chuyên", "địa ốc"]):
-        score += 3
+    name_hits = [kw for kw in _NAME_BROKER_KW if kw in name]
+    if name_hits:
+        score += W_NAME_KW
+        reasons.append(f"T1.contact_name chứa keyword môi giới: {name_hits[:3]}")
 
-    # Description keywords
+    # ===== T3: description/title broker keywords =====
     desc = (dto.description or "").lower()
-    if any(kw in desc for kw in ["hoa hồng", "hotline", "chuyên bán", "cam kết"]):
-        score += 2
-    if any(kw in desc for kw in ["chính chủ", "bán gấp", "không trung gian"]):
-        score -= 2
+    title_lower = (dto.title or "").lower()
+    desc_hits = [kw for kw in _DESC_BROKER_KW if kw in desc or kw in title_lower]
+    if desc_hits:
+        score += W_DESC_BROKER_KW
+        reasons.append(f"T3.description/title chứa keyword môi giới: {desc_hits[:3]}")
 
-    if score >= 4: dto.poster_type = "moi_gioi"
-    elif score <= -2: dto.poster_type = "chu_nha"
-    else: dto.poster_type = "khong_xac_dinh"
+    # Owner counter-signal: "chính chủ" trong title/desc
+    owner_hits = [kw for kw in _OWNER_KW if kw in desc or kw in title_lower]
+    if owner_hits:
+        score += W_OWNER_KW
+        reasons.append(f"O2.title/description chứa keyword chủ nhà: {owner_hits[:3]}")
+
+    # ===== FINAL CLASSIFICATION =====
+    if score >= BROKER_THRESHOLD:
+        owner_type = "BROKER"
+        confidence = min(1.0, score)
+        poster_legacy = "moi_gioi"
+    else:
+        owner_type = "OWNER"
+        confidence = max(0.0, min(1.0, 1.0 - max(0.0, score) / BROKER_THRESHOLD * 0.5))
+        poster_legacy = "chu_nha"
+
+    if not reasons:
+        reasons.append("Không có signal môi giới — phân loại mặc định chủ nhà")
+
+    dto.owner_type = owner_type
+    dto.confidence_score = round(confidence, 3)
+    dto.reason = reasons
+    dto.poster_type = poster_legacy
 
 
 # ============================================================
 # FULL PIPELINE
 # ============================================================
 
-def process_batch(raw_items: list, source: str, address_mapper: AddressMapper = None) -> list:
-    """Process a batch of raw items into clean PropertyDTOs."""
-    results = []
+def process_batch(
+    raw_items: list,
+    source: str,
+    address_mapper: AddressMapper = None,
+    use_db_phone_history: bool = True,
+) -> list:
+    """Process a batch of raw items into clean PropertyDTOs.
 
+    Bước phân loại broker/owner dùng:
+      1. In-cycle phone counter — đếm trong batch hiện tại, cùng source only.
+      2. DB phone history (optional) — query `data_sources.phone_full` cùng source,
+         loại trừ chính source_id đang xử lý để không tự đếm.
+      3. Các signal khác: company_ad, sold_ads, contact_name/desc keywords.
+
+    DB unreachable → bỏ qua signal lịch sử, vẫn classify bằng các signal khác.
+    """
+    # Pre-adapt tất cả để có (phone_full, source_id) trước khi fetch DB
+    adapted: list[tuple[PropertyDTO, dict]] = []
     for raw in raw_items:
-        # Step 1: Adapt to DTO
         if source == "nhatot":
             dto = adapt_nhatot(raw)
         elif source == "muaban":
             dto = adapt_muaban(raw)
         else:
             continue
+        adapted.append((dto, raw))
 
-        # Step 2: Map address to new 34-province system
+    # Build in-cycle phone counter (cùng source duy nhất trong process_batch call này)
+    phone_counter: Counter = Counter()
+    for dto, _ in adapted:
+        ph = _normalize_phone_db(dto.phone_full) if _normalize_phone_db else dto.phone_full
+        if ph:
+            phone_counter[ph] += 1
+
+    # Fetch DB history — bulk, 1 query cho toàn batch
+    db_phone_history: Optional[dict] = None
+    if use_db_phone_history and get_phone_history_counts is not None:
+        exclude_ids: set[str] = {str(dto.source_id) for dto, _ in adapted if dto.source_id}
+        try:
+            db_phone_history = get_phone_history_counts(
+                [(source, ph) for ph in phone_counter],
+                exclude_source_ids={source: exclude_ids} if exclude_ids else None,
+            )
+        except Exception as e:
+            log.warning(f"DB phone-history fetch failed: {e} — fallback in-cycle only")
+            db_phone_history = None
+
+    results: list[PropertyDTO] = []
+    for dto, raw in adapted:
+        # Address normalize
         if address_mapper:
             addr = address_mapper.normalize(
                 old_province=dto.province or "",
@@ -645,12 +797,18 @@ def process_batch(raw_items: list, source: str, address_mapper: AddressMapper = 
             dto.full_address = addr["full_address"]
             dto.district_legacy = addr["district_legacy"]
 
-        # Step 3: Validate price
         validate_price(dto)
 
-        # Step 4: Classify poster
-        classify_poster(dto, raw)
+        # In-cycle count cho riêng listing này = total cùng phone trừ chính nó
+        ph = _normalize_phone_db(dto.phone_full) if _normalize_phone_db else dto.phone_full
+        in_cycle_others = max(0, phone_counter.get(ph, 0) - 1) if ph else 0
 
+        classify_poster(
+            dto,
+            raw,
+            db_phone_history=db_phone_history,
+            in_cycle_phone_count=in_cycle_others,
+        )
         results.append(dto)
 
     return results
